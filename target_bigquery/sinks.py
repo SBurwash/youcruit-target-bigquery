@@ -22,6 +22,11 @@ from singer_sdk.helpers._batch import (
 from fastavro import writer, parse_schema
 from google.cloud import bigquery
 
+from google.cloud.bigquery import Dataset
+from google.cloud.bigquery import DatasetReference
+from google.cloud.exceptions import NotFound
+from google.api_core import exceptions
+
 from .bq import column_type, get_client
 from .avro import avro_schema, fix_recursive_types_in_dict
 
@@ -102,6 +107,8 @@ class BigQuerySink(BatchSink):
 
         self.client.create_table(table=table, exists_ok=True)
 
+
+
     def update_from_temp_table(self, batch_id: str) -> str:
         """Returns a MERGE query"""
         primary_keys = " AND ".join(
@@ -134,6 +141,34 @@ class BigQuerySink(BatchSink):
             if table_name == self.table_name:
                 return True
         return False
+
+
+    def ensure_dataset(self, project_id, dataset_id, location):
+        """
+        Given a project id, dataset id and location, creates BigQuery dataset if not exists
+        https://googleapis.dev/python/bigquery/latest/generated/google.cloud.bigquery.client.Client.html
+        :param project_id, str: GCP project id from target config file. Passed to bigquery.Client().
+        :param dataset_id, str: BigQuery dataset id from target config file.
+        :param location, str: location for the dataset (US). Passed to bigquery.Client().
+        :return: client (BigQuery Client Object) and Dataset (BigQuery dataset)
+        """
+
+        client = bigquery.Client(project=project_id, location=location)
+
+        dataset_ref = DatasetReference(project_id, dataset_id)
+
+        try:
+            dataset = client.get_dataset(dataset_ref)
+            return client, dataset
+
+        except NotFound:
+            try:
+                client.create_dataset(dataset_ref)
+            except exceptions.GoogleAPICallError as e:
+                self.logger.critical(f"unable to create dataset {dataset_id} in project {project_id}; Exception {e}")
+                return 2  # sys.exit(2)
+
+            return client, Dataset(dataset_ref)
 
     def ensure_columns_exist(self):
         """Ensures all columns present in the Singer Schema are also present in Big Query"""
@@ -174,6 +209,7 @@ class BigQuerySink(BatchSink):
         self, filehandle: BinaryIO, batch_id: str
     ) -> bigquery.LoadJob:
         """Starts a load job for the given file."""
+        self.ensure_dataset(self.project_id, self.dataset_id, self.location)
         self.create_table(self.temp_table_name(batch_id), expires=True)
 
         dataset_ref = self.client.dataset(self.dataset_id)
@@ -232,13 +268,13 @@ class BigQuerySink(BatchSink):
             writer(tempfile, self.parsed_schema, avro_records)
 
         self.logger.info(f"[{self.stream_name}][{batch_id}] Uploading LoadJob...")
-
+        self.logger.info("1")
         with open(temp_file, "r+b") as tempfile:
             load_job = self.load_table_from_file(tempfile, batch_id)
 
         # Delete temp file once we are done with it
         Path(temp_file).unlink()
-
+        self.logger.info("2")
         if not self.once_jobs_done:
             self.create_table(self.table_name, expires=False)
             self.ensure_columns_exist()
@@ -246,6 +282,7 @@ class BigQuerySink(BatchSink):
 
         # Await job to finish
         load_job.result()
+        self.logger.info("3")
 
         self.query(
             [
